@@ -1,0 +1,223 @@
+/*
+
+Baseon: bb309748c7ead580f09dd685ba8d1374a539cb1c
+
+*/
+
+
+/*
+ * Copyright (C) 2015, Matthias Sohn <matthias.sohn@sap.com> and others
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Distribution License v. 1.0 which is available at
+ * https://www.eclipse.org/org/documents/edl-v10.php.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+package com.googlesource.gerrit.plugins.lfs;
+// package org.eclipse.jgit.lfs.server.fs;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
+import java.nio.file.Path;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import javax.servlet.AsyncContext;
+import javax.servlet.ReadListener;
+import javax.servlet.ServletInputStream;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+import org.apache.http.HttpStatus;
+import org.eclipse.jgit.lfs.errors.CorruptLongObjectException;
+import org.eclipse.jgit.lfs.internal.AtomicObjectOutputStream;
+import org.eclipse.jgit.lfs.lib.AnyLongObjectId;
+import org.eclipse.jgit.lfs.lib.Constants;
+
+// Sampee
+import org.eclipse.jgit.lfs.server.fs.FileLfsRepository;
+import com.googlesource.gerrit.plugins.lfs.fs.LocalLargeFileRepository;
+import org.eclipse.jgit.lfs.server.fs.FileLfsServlet;
+import org.eclipse.jgit.lfs.server.internal.LfsGson;
+import org.eclipse.jgit.lfs.server.internal.LfsServerText;
+import java.io.PrintWriter;
+import com.googlesource.gerrit.plugins.lfs.ExtRepoPath;
+//
+
+/**
+ * Handle asynchronous object upload.
+ *
+ * @since 4.6
+ */
+public class ExtObjectUploadListener implements ReadListener {
+
+	private final AsyncContext context;
+
+	private final HttpServletResponse response;
+
+	private final ServletInputStream in;
+
+	private final ReadableByteChannel inChannel;
+
+	private final AtomicObjectOutputStream out;
+
+	private WritableByteChannel channel;
+
+	private final ByteBuffer buffer = ByteBuffer.allocateDirect(8192);
+
+	private final Path path;
+
+	private long uploaded;
+
+	private Callback callback;
+
+	/**
+	 * Callback invoked after object upload completed.
+	 *
+	 * @since 5.1.7
+	 */
+	public interface Callback {
+		/**
+		 * Notified after object upload completed.
+		 *
+		 * @param path
+		 *            path to the object on the backend
+		 * @param size
+		 *            uploaded size in bytes
+		 */
+		void uploadCompleted(String path, long size);
+	}
+
+	/**
+	 * Constructor for ExtObjectUploadListener.
+	 *
+	 * @param repository
+	 *            the repository storing large objects
+	 * @param context
+	 *            a {@link javax.servlet.AsyncContext} object.
+	 * @param request
+	 *            a {@link javax.servlet.http.HttpServletRequest} object.
+	 * @param response
+	 *            a {@link javax.servlet.http.HttpServletResponse} object.
+	 * @param id
+	 *            a {@link org.eclipse.jgit.lfs.lib.AnyLongObjectId} object.
+	 * @throws java.io.FileNotFoundException
+	 *             if file wasn't found
+	 * @throws java.io.IOException
+	 *             if an IO error occurred
+	 * @since 7.0
+	 */
+	public ExtObjectUploadListener(
+            ExtRepoPath repoPath,
+            FileLfsRepository _repository,
+			AsyncContext context, HttpServletRequest request,
+			HttpServletResponse response, AnyLongObjectId id)
+					throws FileNotFoundException, IOException {
+		this.context = context;
+		this.response = response;
+		this.in = request.getInputStream();
+		this.inChannel = Channels.newChannel(in);
+
+        if(!(_repository instanceof LocalLargeFileRepository)) {
+			ExtLogger.severe("Invalid repository type");
+            throw new IOException("ExtObjectUploadListener Invalid repository type");
+        }
+        LocalLargeFileRepository repository = (LocalLargeFileRepository)_repository;
+        ExtLogger.infof("constructor repo=%s id= %s", repoPath, id.toString());
+		this.out = repository.getOutputStream(repoPath, id);
+		this.channel = Channels.newChannel(out);
+		this.path = repository.getPath(repoPath, id);
+		this.uploaded = 0L;
+		response.setContentType(Constants.CONTENT_TYPE_GIT_LFS_JSON);
+	}
+
+	/**
+	 * Set the callback to invoke after upload completed.
+	 *
+	 * @param callback
+	 *            the callback
+	 * @return {@code this}.
+	 * @since 5.1.7
+	 */
+	public ExtObjectUploadListener setCallback(Callback callback) {
+		this.callback = callback;
+		return this;
+	}
+
+	/**
+	 * {@inheritDoc}
+	 *
+	 * Writes all the received data to the output channel
+	 */
+	@Override
+	public void onDataAvailable() throws IOException {
+		while (in.isReady()) {
+			if (inChannel.read(buffer) > 0) {
+				buffer.flip();
+				uploaded += Integer.valueOf(channel.write(buffer)).longValue();
+				buffer.compact();
+			} else {
+				buffer.flip();
+				while (buffer.hasRemaining()) {
+					uploaded += Integer.valueOf(channel.write(buffer))
+							.longValue();
+				}
+				close();
+				return;
+			}
+		}
+	}
+
+	@Override
+	public void onAllDataRead() throws IOException {
+		close();
+	}
+
+	/**
+	 * Close resources held by this listener
+	 *
+	 * @throws java.io.IOException
+	 *             if an IO error occurred
+	 */
+	protected void close() throws IOException {
+		try {
+			inChannel.close();
+			channel.close();
+			// TODO check if status 200 is ok for PUT request, HTTP foresees 204
+			// for successful PUT without response body
+			if (!response.isCommitted()) {
+				response.setStatus(HttpServletResponse.SC_OK);
+			}
+			if (callback != null) {
+				callback.uploadCompleted(path.toString(), uploaded);
+			}
+		} finally {
+			context.complete();
+		}
+	}
+
+	@Override
+	public void onError(Throwable e) {
+		try {
+			out.abort();
+			inChannel.close();
+			channel.close();
+			int status;
+			if (e instanceof CorruptLongObjectException) {
+				status = HttpStatus.SC_BAD_REQUEST;
+				ExtLogger.warning(e.getMessage());
+			} else {
+				status = HttpStatus.SC_INTERNAL_SERVER_ERROR;
+				ExtLogger.severe(e.getMessage());
+			}
+			ExtObjectDownloadListener.sendError(response, status, e.getMessage());
+		} catch (IOException ex) {
+		 	ExtLogger.infof("err %s", ex.getMessage());
+		}
+	}
+}

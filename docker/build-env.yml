@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  gerrit-builder-3.13:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GERRIT_VERSION: 3.13.0
+        JAVA_VERSION: 21
+        NODE_VERSION: 20
+    image: gerrit-builder:3.13
+    container_name: gerrit-plugin-builder-3.13
+    volumes:
+      # Mount your plugin source code here
+      - ./plugins:/workspace/plugins:rw
+      # Persist Bazel cache for faster rebuilds
+      - bazel-cache:/workspace/.bazel-cache
+      # Persist Bazelisk downloads
+      - bazelisk-home:/workspace/.bazelisk
+      # Optional: Mount local Maven repository
+      - maven-repo:/home/builder/.m2
+      - /mnt:/mnt:rw
+    environment:
+      - GERRIT_VERSION=3.13.0
+      - JAVA_HOME=/usr/lib/jvm/temurin-21-jdk-amd64
+      - BAZEL_CACHE=/workspace/.bazel-cache
+    working_dir: /workspace
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    # Keep container running
+    restart: unless-stopped
+
+volumes:
+  bazel-cache:
+  bazelisk-home:
+  maven-repo:

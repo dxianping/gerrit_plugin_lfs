@@ -1,0 +1,128 @@
+# Gerrit 3.13 Plugin Build Environment
+# Based on Ubuntu 24.04 LTS (same as official Gerrit 3.13 Docker images)
+FROM ubuntu:24.04
+
+LABEL maintainer="your-email@example.com"
+LABEL description="Gerrit 3.13 Plugin Build Environment"
+LABEL version="3.13.0"
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Build arguments
+ARG GERRIT_VERSION=3.13.0
+ARG JAVA_VERSION=21
+ARG NODE_VERSION=20
+ARG BAZELISK_VERSION=v1.20.0
+
+# Environment variables
+ENV JAVA_HOME=/usr/lib/jvm/temurin-${JAVA_VERSION}-jdk-amd64
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+ENV GERRIT_SITE=/var/gerrit
+ENV BUILD_USER=builder
+ENV BUILD_UID=1511
+ENV BUILD_GID=1500
+
+RUN rm -f /etc/apt/sources.list.d/*.sources && \
+    cat > /etc/apt/sources.list <<EOF
+deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse
+deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse
+deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted universe multiverse
+deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-security main restricted universe multiverse
+EOF
+
+# Install base dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Basic tools
+    curl \
+    wget \
+    git \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    # Build essentials
+    build-essential \
+    gcc \
+    g++ \
+    make \
+    zip \
+    unzip \
+    # Python
+    python3 \
+    python3-pip \
+    python3-venv \
+    # Other tools
+    locales \
+    sudo \
+    vim \
+    nano \
+    less \
+    # Maven
+    maven \
+    # Additional libraries
+    libfontconfig1 \
+    libfreetype6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up locale
+RUN locale-gen en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
+
+# Install Eclipse Temurin JDK 21 (same as official Gerrit 3.13 images)
+RUN mkdir -p /etc/apt/keyrings \
+    && wget -O - https://packages.adoptium.net/artifactory/api/gpg/key/public | tee /etc/apt/keyrings/adoptium.asc \
+    && echo "deb [signed-by=/etc/apt/keyrings/adoptium.asc] https://packages.adoptium.net/artifactory/deb $(awk -F= '/^VERSION_CODENAME/{print$2}' /etc/os-release) main" | tee /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update \
+    && apt-get install -y temurin-${JAVA_VERSION}-jdk \
+    && rm -rf /var/lib/apt/lists/*
+
+# Verify Java installation
+RUN java -version && javac -version
+
+# Install Node.js 20.x (LTS) and npm
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install global npm packages for Gerrit build
+RUN npm install -g \
+    bower \
+    polymer-cli \
+    @bazel/bazelisk \
+    && npm cache clean --force
+
+# Install Bazelisk manually (ensuring latest version)
+RUN curl -Lo /usr/local/bin/bazelisk "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-amd64" \
+    && chmod +x /usr/local/bin/bazelisk \
+    && ln -sf /usr/local/bin/bazelisk /usr/local/bin/bazel
+
+# Create build user
+RUN groupadd -g ${BUILD_GID} ${BUILD_USER} \
+    && useradd -u ${BUILD_UID} -g ${BUILD_GID} -m -s /bin/bash ${BUILD_USER} \
+    && echo "${BUILD_USER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/${BUILD_USER} \
+    && chmod 0440 /etc/sudoers.d/${BUILD_USER}
+
+# Create workspace directories
+RUN mkdir -p /workspace/gerrit /workspace/plugins ${GERRIT_SITE} \
+    && chown -R ${BUILD_USER}:${BUILD_USER} /workspace ${GERRIT_SITE}
+
+# Switch to build user
+USER ${BUILD_USER}
+WORKDIR /workspace
+
+# Configure git
+RUN git config --global user.email "builder@localhost" \
+    && git config --global user.name "Gerrit Builder" \
+    && git config --global --add safe.directory /workspace/gerrit
+
+# Set Bazel cache directory (for better performance)
+ENV BAZEL_CACHE=/workspace/.bazel-cache
+RUN mkdir -p ${BAZEL_CACHE}
+ENV BAZELISK_HOME=/workspace/.bazelisk
+
+# Default command
+CMD ["/bin/bash"]
